@@ -2,8 +2,11 @@ import Groq from "groq-sdk";
 import OpenAI from "openai";
 import { config } from "../config.js";
 import { dbService, MessageRow } from "../db/sqlite.js";
+import { pineconeService } from "../db/pinecone.js";
+import { supabaseService } from "../db/supabase.js";
 import { SYSTEM_PROMPT } from "./prompts.js";
 import { AVAILABLE_TOOLS, executeTool } from "./tools.js";
+import { backgroundFactExtraction, backgroundCompaction } from "./extract-facts.js";
 
 const groq = new Groq({ apiKey: config.apiKeys.groq });
 const openai = config.apiKeys.openrouter
@@ -25,21 +28,43 @@ type ChatMessage = {
 };
 
 export async function processUserMessage(userId: number, text: string): Promise<string> {
-    // Add user message to DB
-    dbService.addMessage(userId, "user", text);
+    // Load Memory (parallel) - Tiers 1 and 2
+    const [coreFacts, latestHistory, summaryObj, semanticResults] = await Promise.all([
+        Promise.resolve(dbService.getFacts(userId)),
+        Promise.resolve(dbService.getHistory(userId, 20)),
+        Promise.resolve(dbService.getLatestSummary(userId)),
+        pineconeService.searchMemory(userId, text, 3).catch(() => [] as string[])
+    ]);
 
-    // Retrieve conversation history
-    const history = dbService.getHistory(userId, 20); // Get last 20 messages for context
+    // Build Context
+    let contextualSystemPrompt = SYSTEM_PROMPT + "\n\n--- CURRENT USER CONTEXT ---\n";
 
-    // Prepare messages array for LLM
+    if (coreFacts && coreFacts.length > 0) {
+        contextualSystemPrompt += "CORE FACTS ABOUT USER:\n";
+        coreFacts.forEach(f => contextualSystemPrompt += `- ${f.fact}\n`);
+    }
+
+    if (summaryObj) {
+        contextualSystemPrompt += `\nPAST CONVERSATION SUMMARY:\n${summaryObj.summary}\n`;
+    }
+
+    if (semanticResults && semanticResults.length > 0) {
+        contextualSystemPrompt += `\nSEMANTIC RECALL (Matches to user query):\n`;
+        semanticResults.forEach((str, i) => contextualSystemPrompt += `[Match ${i + 1}]: ${str}\n`);
+    }
+
+    // Prepend context to chat history
     const messages: ChatMessage[] = [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: contextualSystemPrompt },
     ];
 
-    for (const row of history) {
-        if (row.role === "tool") continue; // We simplify and might not send raw tool returns if they are just conversational context
+    for (const row of latestHistory) {
+        if (row.role === "tool") continue;
         messages.push({ role: row.role as any, content: row.content });
     }
+
+    // Add the new user message (not yet in SQLite to keep DB non-blocking for inference generation if possible, but actually we should add it now)
+    messages.push({ role: "user", content: text });
 
     let iterations = 0;
     let finalResponse = "";
@@ -54,9 +79,8 @@ export async function processUserMessage(userId: number, text: string): Promise<
                 throw new Error("Empty response from LLM");
             }
 
-            // If the model wants to call tools
             if (message.tool_calls && message.tool_calls.length > 0) {
-                messages.push(message as any); // Add assistant message with tool calls
+                messages.push(message as any);
 
                 for (const toolCall of message.tool_calls) {
                     const functionName = toolCall.function.name;
@@ -64,12 +88,13 @@ export async function processUserMessage(userId: number, text: string): Promise<
 
                     let toolResult = "";
                     try {
-                        toolResult = await executeTool(functionName, functionArgs);
+                        toolResult = await executeTool(functionName, functionArgs, userId);
+                        supabaseService.logActivity(userId, `Tool:${functionName}`, JSON.stringify(functionArgs));
                     } catch (error: any) {
                         toolResult = `Error executing tool: ${error.message}`;
+                        supabaseService.logActivity(userId, `ToolError:${functionName}`, error.message, "error");
                     }
 
-                    // Convert object returns to string to append to context
                     if (typeof toolResult !== "string") {
                         toolResult = JSON.stringify(toolResult);
                     }
@@ -81,17 +106,14 @@ export async function processUserMessage(userId: number, text: string): Promise<
                         content: toolResult
                     });
                 }
-                // Loop continues to let the LLM see the tool output and generate a final response
             } else {
-                // No more tool calls, we have the final answer
                 finalResponse = message.content || "";
-                dbService.addMessage(userId, "assistant", finalResponse);
                 break;
             }
-
         } catch (error: any) {
             console.error("Error calling LLM:", error);
             finalResponse = "Lo siento, ha ocurrido un error al procesar tu solicitud.";
+            supabaseService.logActivity(userId, "AgentCrash", error.message, "error");
             break;
         }
     }
@@ -100,12 +122,24 @@ export async function processUserMessage(userId: number, text: string): Promise<
         finalResponse = "He alcanzado el límite de operaciones internas para esta solicitud.";
     }
 
+    // Background Tasks (Fire-and-forget)
+    // Ensure the user text and final response are saved to sqlite
+    dbService.addMessage(userId, "user", text);
+    dbService.addMessage(userId, "assistant", finalResponse);
+
+    // Tier 1 and Tier 2 background jobs
+    setImmediate(() => {
+        backgroundFactExtraction(userId, text, finalResponse);
+        backgroundCompaction(userId);
+        pineconeService.embedAndStoreExchange(userId, `User: ${text}\nNjambre: ${finalResponse}`);
+        supabaseService.logActivity(userId, "ExchangeSaved", "Finished conversation cycle.");
+    });
+
     return finalResponse;
 }
 
 async function callLLM(messages: ChatMessage[]) {
     try {
-        // Try Groq first
         return await groq.chat.completions.create({
             model: LLM_MODEL,
             messages: messages as any[],
@@ -115,18 +149,12 @@ async function callLLM(messages: ChatMessage[]) {
     } catch (error: any) {
         console.error("Groq API error, attempting fallback...", error.message);
         if (openai) {
-            try {
-                // Fallback to OpenRouter
-                return await openai.chat.completions.create({
-                    model: config.models.fallback,
-                    messages: messages as any[],
-                    tools: AVAILABLE_TOOLS as any[],
-                    tool_choice: "auto",
-                });
-            } catch (fallbackError: any) {
-                console.error("Fallback API error:", fallbackError);
-                throw new Error("Both primary and fallback LLM requests failed.");
-            }
+            return await openai.chat.completions.create({
+                model: config.models.fallback,
+                messages: messages as any[],
+                tools: AVAILABLE_TOOLS as any[],
+                tool_choice: "auto",
+            });
         } else {
             throw error;
         }

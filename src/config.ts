@@ -10,6 +10,9 @@ const {
     OPENROUTER_API_KEY,
     OPENROUTER_MODEL,
     DB_PATH,
+    PINECONE_API_KEY,
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -46,11 +49,14 @@ export const config = {
     apiKeys: {
         groq: GROQ_API_KEY,
         openrouter: OPENROUTER_API_KEY || "",
+        pinecone: PINECONE_API_KEY || "",
+        supabaseUrl: SUPABASE_URL || "",
+        supabaseKey: SUPABASE_ANON_KEY || "",
     },
     models: {
         fallback: OPENROUTER_MODEL || "openrouter/free",
     },
     db: {
-        path: DB_PATH || "./memory.db",
+        path: DB_PATH || "./gravity-claw.db",
     },
 };
